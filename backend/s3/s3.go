@@ -5648,9 +5648,11 @@ func (f *Fs) headObject(ctx context.Context, req *s3.HeadObjectInput) (resp *s3.
 	if f.opt.SSECustomerKeyMD5 != "" {
 		req.SSECustomerKeyMD5 = &f.opt.SSECustomerKeyMD5
 	}
+	// Set the SDK to always download compressed files as-is
+	options := s3.WithAPIOptions(f.acceptEncoding()...)
 	err = f.pacer.Call(func() (bool, error) {
 		var err error
-		resp, err = f.c.HeadObject(ctx, req)
+		resp, err = f.c.HeadObject(ctx, req, options)
 		return f.shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -5862,6 +5864,25 @@ func (o *Object) downloadFromURL(ctx context.Context, bucketPath string, options
 	return resp.Body, err
 }
 
+// middleware to stop the SDK adding `Accept-Encoding: identity`
+func removeDisableGzip() func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		_, err := stack.Finalize.Remove("DisableAcceptEncodingGzip")
+		return err
+	}
+}
+
+// middleware to set Accept-Encoding to how we want it
+//
+// This make sure we download compressed files as-is from all platforms
+func (f *Fs) acceptEncoding() (APIOptions []func(*middleware.Stack) error) {
+	APIOptions = append(APIOptions, removeDisableGzip())
+	if f.opt.UseAcceptEncodingGzip.Value {
+		APIOptions = append(APIOptions, smithyhttp.AddHeaderValue("Accept-Encoding", "gzip"))
+	}
+	return APIOptions
+}
+
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	bucket, bucketPath := o.split()
@@ -5895,11 +5916,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 
 	var APIOptions []func(*middleware.Stack) error
 
-	// Override the automatic decompression in the transport to
-	// download compressed files as-is
-	if o.fs.opt.UseAcceptEncodingGzip.Value {
-		APIOptions = append(APIOptions, smithyhttp.AddHeaderValue("Accept-Encoding", "gzip"))
-	}
+	// Set the SDK to always download compressed files as-is
+	APIOptions = append(APIOptions, o.fs.acceptEncoding()...)
 
 	for _, option := range options {
 		switch option.(type) {
